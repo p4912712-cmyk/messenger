@@ -1,7 +1,6 @@
 {
-  "name": "whatsapp-clone",
+  "name": "messenger",
   "version": "1.0.0",
-  "description": "Simple real-time chat like WhatsApp",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
