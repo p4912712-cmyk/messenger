@@ -6,6 +6,10 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
+app.get('/ping', (req, res) => {
+    res.send('pong');
+});
+
 app.use(express.static('public'));
 
 // Хранилище данных
