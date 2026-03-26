@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,10 +14,29 @@ app.get('/ping', (req, res) => {
 
 app.use(express.static('public'));
 
-// Хранилища
-const users = new Map();          // socketId -> { username, avatar? }
-const messages = new Map();       // key = "user1:user2" -> array
-const userAvatars = new Map();    // username -> base64 avatar
+// Файл для хранения сообщений
+const MESSAGES_FILE = path.join(__dirname, 'messages.json');
+
+// Загружаем сохранённые сообщения при старте
+let messages = new Map(); // ключ "user1:user2" -> массив сообщений
+if (fs.existsSync(MESSAGES_FILE)) {
+    try {
+        const data = fs.readFileSync(MESSAGES_FILE, 'utf8');
+        const parsed = JSON.parse(data);
+        messages = new Map(Object.entries(parsed));
+    } catch (err) {
+        console.error('Ошибка загрузки сообщений:', err);
+    }
+}
+
+// Функция сохранения сообщений в файл
+function saveMessages() {
+    const obj = Object.fromEntries(messages);
+    fs.writeFileSync(MESSAGES_FILE, JSON.stringify(obj, null, 2));
+}
+
+// Хранилище пользователей онлайн
+const users = new Map(); // socketId -> { username }
 
 function getDialogKey(u1, u2) {
     const [a, b] = [u1, u2].sort();
@@ -26,7 +47,8 @@ io.on('connection', (socket) => {
     console.log(`New connection: ${socket.id}`);
 
     // Регистрация
-    socket.on('register', ({ username, avatar }, callback) => {
+    socket.on('register', ({ username }, callback) => {
+        // Проверка уникальности имени среди онлайн
         let isUnique = true;
         for (let [id, u] of users.entries()) {
             if (u.username === username && id !== socket.id) {
@@ -39,38 +61,31 @@ io.on('connection', (socket) => {
             return;
         }
 
-        const userData = { username, socketId: socket.id };
-        if (avatar) userData.avatar = avatar;
+        const userData = { username };
         users.set(socket.id, userData);
         socket.username = username;
 
-        if (avatar) userAvatars.set(username, avatar);
-        else if (!userAvatars.has(username)) {
-            // Аватар по умолчанию – null, клиент сам покажет инициалы
-            userAvatars.set(username, null);
-        }
-
-        const userList = Array.from(users.values()).map(u => ({
-            username: u.username,
-            avatar: userAvatars.get(u.username) || null
-        }));
+        // Отправляем новому пользователю список онлайн-пользователей (всех, кроме него)
+        const userList = Array.from(users.values())
+            .filter(u => u.username !== username)
+            .map(u => ({ username: u.username }));
         socket.emit('user list', userList);
-        socket.broadcast.emit('user joined', {
-            username,
-            avatar: userAvatars.get(username)
-        });
 
-        callback({ success: true, username, avatar: userAvatars.get(username) });
+        // Оповещаем всех остальных о новом пользователе
+        socket.broadcast.emit('user joined', { username });
+
+        callback({ success: true, username });
     });
 
+    // Получение списка онлайн-пользователей (для тех, кто уже зарегистрирован)
     socket.on('get users', () => {
-        const userList = Array.from(users.values()).map(u => ({
-            username: u.username,
-            avatar: userAvatars.get(u.username) || null
-        }));
+        const userList = Array.from(users.values())
+            .filter(u => u.username !== socket.username)
+            .map(u => ({ username: u.username }));
         socket.emit('user list', userList);
     });
 
+    // Запрос истории сообщений с конкретным пользователем
     socket.on('get history', (targetUsername) => {
         const current = socket.username;
         if (!current) return;
@@ -79,6 +94,7 @@ io.on('connection', (socket) => {
         socket.emit('chat history', { target: targetUsername, messages: history });
     });
 
+    // Отправка личного сообщения
     socket.on('private message', ({ to, type, content }) => {
         const from = socket.username;
         if (!from || !to) return;
@@ -97,7 +113,8 @@ io.on('connection', (socket) => {
         if (!messages.has(key)) messages.set(key, []);
         const dialog = messages.get(key);
         dialog.push(message);
-        if (dialog.length > 200) dialog.shift();
+        if (dialog.length > 200) dialog.shift(); // ограничим историю
+        saveMessages(); // сохраняем после каждого изменения
 
         // Отправить отправителю и получателю
         socket.emit('private message', message);
@@ -113,16 +130,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('update avatar', (avatarBase64) => {
-        const username = socket.username;
-        if (username && avatarBase64) {
-            userAvatars.set(username, avatarBase64);
-            const user = users.get(socket.id);
-            if (user) user.avatar = avatarBase64;
-            io.emit('avatar updated', { username, avatar: avatarBase64 });
-        }
-    });
-
+    // Отключение пользователя
     socket.on('disconnect', () => {
         const user = users.get(socket.id);
         if (user) {
@@ -134,4 +142,6 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});

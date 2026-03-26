@@ -53,14 +53,6 @@
             border: none;
             cursor: pointer;
         }
-        .avatar-preview {
-            width: 80px;
-            height: 80px;
-            border-radius: 50%;
-            background: #ddd;
-            margin: 10px auto;
-            object-fit: cover;
-        }
         /* Список чатов */
         .chats-header {
             background: #075e54;
@@ -98,7 +90,6 @@
             font-size: 20px;
             color: white;
             margin-right: 12px;
-            object-fit: cover;
         }
         .chat-info { flex: 1; }
         .chat-name { font-weight: 600; margin-bottom: 4px; }
@@ -136,7 +127,6 @@
             width: 40px;
             height: 40px;
             border-radius: 50%;
-            object-fit: cover;
             background: #25d366;
             display: flex;
             align-items: center;
@@ -232,9 +222,6 @@
     <div id="loginScreen" class="screen login-container">
         <div class="login-card">
             <h2>Вход в мессенджер</h2>
-            <img id="avatarPreview" class="avatar-preview" src="" alt="Avatar">
-            <input type="file" id="avatarInput" accept="image/*" style="display: none;">
-            <button id="pickAvatarBtn">Выбрать аватар</button>
             <input type="text" id="usernameInput" placeholder="Ваше имя" autocomplete="off">
             <button id="loginBtn">Войти</button>
             <div id="loginError" style="color:red; margin-top:8px;"></div>
@@ -247,10 +234,7 @@
         <div id="chatsView" class="screen">
             <div class="chats-header">
                 <span>Чаты</span>
-                <div>
-                    <button id="changeAvatarBtn" class="icon-button" style="color:white;">🖼️</button>
-                    <button id="logoutBtn" class="icon-button" style="color:white;">🚪</button>
-                </div>
+                <button id="logoutBtn" class="icon-button" style="color:white;">🚪</button>
             </div>
             <div id="chatsList" class="chats-list"></div>
         </div>
@@ -259,7 +243,7 @@
         <div id="chatView" class="screen hidden">
             <div class="chat-header">
                 <button id="backBtn" class="back-button">←</button>
-                <img id="chatAvatar" class="chat-header-avatar" src="" alt="">
+                <div class="chat-header-avatar" id="chatAvatarPlaceholder"></div>
                 <div class="chat-header-info">
                     <div id="chatUserName" class="chat-header-name"></div>
                 </div>
@@ -283,13 +267,12 @@
     let socket;
     let currentUser = null;
     let currentChatWith = null;
-    let allUsers = [];
-    let chats = new Map();           // username -> { avatar, lastMessage }
-    let messagesCache = new Map();
+    let onlineUsers = [];               // список имён онлайн-пользователей
+    let chats = new Map();              // username -> { lastMessage }
+    let messagesCache = new Map();      // username -> массив сообщений
     let mediaRecorder;
     let recordedChunks = [];
     let isRecording = false;
-    let myAvatar = null;
     let notificationPermission = false;
 
     // DOM элементы
@@ -300,14 +283,10 @@
     const usernameInput = document.getElementById('usernameInput');
     const loginBtn = document.getElementById('loginBtn');
     const loginError = document.getElementById('loginError');
-    const avatarPreview = document.getElementById('avatarPreview');
-    const pickAvatarBtn = document.getElementById('pickAvatarBtn');
-    const avatarInput = document.getElementById('avatarInput');
-    const changeAvatarBtn = document.getElementById('changeAvatarBtn');
     const logoutBtn = document.getElementById('logoutBtn');
     const chatsListDiv = document.getElementById('chatsList');
     const backBtn = document.getElementById('backBtn');
-    const chatAvatar = document.getElementById('chatAvatar');
+    const chatAvatarPlaceholder = document.getElementById('chatAvatarPlaceholder');
     const chatUserName = document.getElementById('chatUserName');
     const callBtn = document.getElementById('callBtn');
     const chatMessagesDiv = document.getElementById('chatMessages');
@@ -322,28 +301,12 @@
         return name.charAt(0).toUpperCase();
     }
 
-    function getAvatarUrl(avatar, username) {
-        if (avatar && avatar.startsWith('data:image')) return avatar;
-        // Генерируем цветную заглушку с инициалами
-        const canvas = document.createElement('canvas');
-        canvas.width = 100;
-        canvas.height = 100;
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#075e54';
-        ctx.fillRect(0, 0, 100, 100);
-        ctx.fillStyle = 'white';
-        ctx.font = 'bold 50px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(getInitials(username), 50, 55);
-        return canvas.toDataURL();
-    }
-
     function updateChatsList() {
+        // Сортируем чаты по времени последнего сообщения
         const chatArray = Array.from(chats.values()).sort((a,b) => (b.lastMessage?.timestamp||0) - (a.lastMessage?.timestamp||0));
         chatsListDiv.innerHTML = chatArray.map(chat => `
             <div class="chat-item" data-username="${chat.username}">
-                <img class="chat-avatar" src="${getAvatarUrl(chat.avatar, chat.username)}" onerror="this.src=''">
+                <div class="chat-avatar">${getInitials(chat.username)}</div>
                 <div class="chat-info">
                     <div class="chat-name">${escapeHtml(chat.username)}</div>
                     <div class="chat-last-msg">${chat.lastMessage ? (chat.lastMessage.type==='text'?escapeHtml(chat.lastMessage.content):(chat.lastMessage.type==='image'?'📷 Фото':'🎤 Голосовое')) : ''}</div>
@@ -425,35 +388,44 @@
     // ------------------- Сокет события -------------------
     function setupSocketEvents() {
         socket.on('user list', (users) => {
-            allUsers = users.filter(u => u.username !== currentUser);
-            for (let u of allUsers) {
-                if (!chats.has(u.username)) {
-                    chats.set(u.username, { username: u.username, avatar: u.avatar, lastMessage: null });
-                } else {
-                    chats.get(u.username).avatar = u.avatar;
+            onlineUsers = users.map(u => u.username);
+            // Обновляем чаты: оставляем только тех, кто онлайн
+            for (let [username, chat] of chats.entries()) {
+                if (!onlineUsers.includes(username)) {
+                    chats.delete(username);
+                }
+            }
+            // Добавляем новых онлайн-пользователей, которых ещё нет в чатах
+            for (let username of onlineUsers) {
+                if (!chats.has(username)) {
+                    chats.set(username, { username, lastMessage: null });
                 }
             }
             updateChatsList();
         });
 
         socket.on('user joined', (user) => {
-            if (user.username !== currentUser) {
-                if (!chats.has(user.username)) {
-                    chats.set(user.username, { username: user.username, avatar: user.avatar, lastMessage: null });
-                } else {
-                    chats.get(user.username).avatar = user.avatar;
-                }
+            if (user.username !== currentUser && !chats.has(user.username)) {
+                chats.set(user.username, { username: user.username, lastMessage: null });
                 updateChatsList();
             }
         });
 
         socket.on('user left', (username) => {
-            // Можно пометить офлайн, но оставляем в списке
+            if (chats.has(username)) {
+                chats.delete(username);
+                updateChatsList();
+                // Если текущий чат с ушедшим пользователем, закрываем его
+                if (currentChatWith === username) {
+                    backBtn.click();
+                }
+            }
         });
 
         socket.on('private message', (msg) => {
             const fromMe = msg.from === currentUser;
             const other = fromMe ? msg.to : msg.from;
+            // Обновляем последнее сообщение в чате
             if (chats.has(other)) {
                 chats.get(other).lastMessage = msg;
                 updateChatsList();
@@ -476,25 +448,14 @@
                 messagesCache.set(target, messages);
             }
         });
-
-        socket.on('avatar updated', ({ username, avatar }) => {
-            if (chats.has(username)) {
-                chats.get(username).avatar = avatar;
-                updateChatsList();
-            }
-            if (currentChatWith === username) {
-                chatAvatar.src = getAvatarUrl(avatar, username);
-            }
-        });
     }
 
     // ------------------- Открытие чата -------------------
     function openChat(username) {
         currentChatWith = username;
-        const user = allUsers.find(u => u.username === username);
-        const avatarUrl = getAvatarUrl(user?.avatar, username);
-        chatAvatar.src = avatarUrl;
+        // Устанавливаем заголовок чата
         chatUserName.textContent = username;
+        chatAvatarPlaceholder.textContent = getInitials(username);
         chatsView.classList.add('hidden');
         chatView.classList.remove('hidden');
         chatMessagesDiv.innerHTML = '';
@@ -529,31 +490,27 @@
         }
     }
 
-    // ------------------- Инициализация -------------------
-    pickAvatarBtn.onclick = () => avatarInput.click();
-    avatarInput.onchange = (e) => {
-        const file = e.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-                myAvatar = ev.target.result;
-                avatarPreview.src = myAvatar;
-            };
-            reader.readAsDataURL(file);
+    // ------------------- Авторизация и запоминание устройства -------------------
+    function attemptAutoLogin() {
+        const savedUsername = localStorage.getItem('messenger_username');
+        if (savedUsername) {
+            usernameInput.value = savedUsername;
+            login();
         }
-    };
+    }
 
-    loginBtn.onclick = () => {
+    function login() {
         const username = usernameInput.value.trim();
         if (!username) {
             loginError.textContent = 'Введите имя';
             return;
         }
         socket = io();
-        socket.emit('register', { username, avatar: myAvatar }, (response) => {
+        socket.emit('register', { username }, (response) => {
             if (response.success) {
                 currentUser = username;
-                myAvatar = response.avatar;
+                // Сохраняем имя в localStorage
+                localStorage.setItem('messenger_username', username);
                 loginScreen.classList.add('hidden');
                 mainApp.classList.remove('hidden');
                 chatsView.classList.remove('hidden');
@@ -565,28 +522,17 @@
                 loginError.textContent = response.error;
             }
         });
-    };
+    }
 
-    changeAvatarBtn.onclick = () => {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = 'image/*';
-        input.onchange = (e) => {
-            const file = e.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = (ev) => {
-                    const newAvatar = ev.target.result;
-                    myAvatar = newAvatar;
-                    socket.emit('update avatar', newAvatar);
-                };
-                reader.readAsDataURL(file);
-            }
-        };
-        input.click();
-    };
+    loginBtn.onclick = login;
+    usernameInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') login();
+    });
 
-    logoutBtn.onclick = () => location.reload();
+    logoutBtn.onclick = () => {
+        localStorage.removeItem('messenger_username');
+        location.reload();
+    };
 
     backBtn.onclick = () => {
         currentChatWith = null;
@@ -634,6 +580,9 @@
             return m;
         });
     }
+
+    // Попытка автоматического входа
+    attemptAutoLogin();
 </script>
 </body>
 </html>
