@@ -8,53 +8,45 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-app.get('/ping', (req, res) => {
-    res.send('pong');
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
 
 app.use(express.static('public'));
 
-// Хранилища
-const users = new Map();          // socketId -> username
-const messages = new Map();       // key = "user1:user2" -> array
-const MESSAGES_FILE = path.join(__dirname, 'messages.json');
+// Хранилище активных пользователей: socketId -> username
+const users = new Map();
+// Хранилище сообщений: ключ "user1:user2" -> массив сообщений
+let messages = new Map();
 
-// Загружаем сообщения из файла
-function loadMessages() {
+// Загрузка истории из файла (если есть)
+const HISTORY_FILE = path.join(__dirname, 'messages.json');
+if (fs.existsSync(HISTORY_FILE)) {
     try {
-        if (fs.existsSync(MESSAGES_FILE)) {
-            const data = fs.readFileSync(MESSAGES_FILE, 'utf8');
-            const loaded = JSON.parse(data);
-            for (const [key, value] of Object.entries(loaded)) {
-                messages.set(key, value);
-            }
-            console.log('Messages loaded from file');
-        }
-    } catch (err) {
-        console.error('Error loading messages:', err);
-    }
+        const data = fs.readFileSync(HISTORY_FILE, 'utf8');
+        const parsed = JSON.parse(data);
+        messages = new Map(Object.entries(parsed));
+    } catch(e) { console.error('Ошибка загрузки истории:', e); }
 }
 
-// Сохраняем сообщения в файл
-function saveMessages() {
+// Функция сохранения истории в файл
+function saveHistory() {
     const obj = Object.fromEntries(messages);
-    fs.writeFile(MESSAGES_FILE, JSON.stringify(obj, null, 2), err => {
-        if (err) console.error('Error saving messages:', err);
-    });
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(obj, null, 2));
 }
 
-loadMessages();
-
-function getDialogKey(u1, u2) {
-    const [a, b] = [u1, u2].sort();
+function getDialogKey(user1, user2) {
+    const [a, b] = [user1, user2].sort();
     return `${a}:${b}`;
 }
 
 io.on('connection', (socket) => {
     console.log(`New connection: ${socket.id}`);
 
-    socket.on('register', ({ username }, callback) => {
-        // Проверка уникальности имени среди активных
+    // Регистрация
+    socket.on('register', (username, callback) => {
+        // Проверка уникальности имени
         let isUnique = true;
         for (let [id, u] of users.entries()) {
             if (u === username && id !== socket.id) {
@@ -70,21 +62,23 @@ io.on('connection', (socket) => {
         users.set(socket.id, username);
         socket.username = username;
 
-        // Отправляем текущему пользователю список онлайн-пользователей
-        const userList = Array.from(users.values()).map(u => ({ username: u }));
-        socket.emit('user list', userList);
+        // Отправляем список активных пользователей (без себя)
+        const activeUsers = Array.from(users.values()).filter(u => u !== username);
+        socket.emit('user list', activeUsers);
 
-        // Оповещаем всех о новом пользователе
-        socket.broadcast.emit('user joined', { username });
+        // Оповещаем всех остальных о новом пользователе
+        socket.broadcast.emit('user joined', username);
 
         callback({ success: true, username });
     });
 
+    // Получение списка активных пользователей
     socket.on('get users', () => {
-        const userList = Array.from(users.values()).map(u => ({ username: u }));
-        socket.emit('user list', userList);
+        const activeUsers = Array.from(users.values()).filter(u => u !== socket.username);
+        socket.emit('user list', activeUsers);
     });
 
+    // Запрос истории сообщений с конкретным пользователем
     socket.on('get history', (targetUsername) => {
         const current = socket.username;
         if (!current) return;
@@ -93,6 +87,7 @@ io.on('connection', (socket) => {
         socket.emit('chat history', { target: targetUsername, messages: history });
     });
 
+    // Отправка текстового сообщения
     socket.on('private message', ({ to, text }) => {
         const from = socket.username;
         if (!from || !to || !text) return;
@@ -110,15 +105,15 @@ io.on('connection', (socket) => {
         if (!messages.has(key)) messages.set(key, []);
         const dialog = messages.get(key);
         dialog.push(message);
+        // Ограничим историю 200 сообщениями на диалог
         if (dialog.length > 200) dialog.shift();
+        // Сохраняем изменения в файл
+        saveHistory();
 
-        // Сохраняем в файл
-        saveMessages();
-
-        // Отправляем отправителю
+        // Отправить отправителю
         socket.emit('private message', message);
 
-        // Отправляем получателю, если онлайн
+        // Найти получателя и отправить ему
         let recipientId = null;
         for (let [id, u] of users.entries()) {
             if (u === to) {
@@ -131,15 +126,18 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Отключение пользователя
     socket.on('disconnect', () => {
         const username = users.get(socket.id);
         if (username) {
             users.delete(socket.id);
-            io.emit('user left', username);
+            socket.broadcast.emit('user left', username);
             console.log(`User ${username} disconnected`);
         }
     });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
