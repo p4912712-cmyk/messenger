@@ -12,94 +12,117 @@ app.get('/ping', (req, res) => {
 
 app.use(express.static('public'));
 
-// Хранилище данных
-const users = new Map(); // socketId -> { username }
-const messages = new Map(); // `${username1}:${username2}` -> массив сообщений
+// Хранилища
+const users = new Map();          // socketId -> { username, avatar? }
+const messages = new Map();       // key = "user1:user2" -> array
+const userAvatars = new Map();    // username -> base64 avatar
+
+function getDialogKey(u1, u2) {
+    const [a, b] = [u1, u2].sort();
+    return `${a}:${b}`;
+}
 
 io.on('connection', (socket) => {
     console.log(`New connection: ${socket.id}`);
 
-    // Регистрация пользователя
-    socket.on('register', (username, callback) => {
-        // Проверка уникальности имени
+    // Регистрация
+    socket.on('register', ({ username, avatar }, callback) => {
         let isUnique = true;
-        for (let [id, user] of users.entries()) {
-            if (user.username === username && id !== socket.id) {
+        for (let [id, u] of users.entries()) {
+            if (u.username === username && id !== socket.id) {
                 isUnique = false;
                 break;
             }
         }
         if (!isUnique) {
-            callback({ success: false, error: 'Username already taken' });
+            callback({ success: false, error: 'Имя уже занято' });
             return;
         }
 
-        // Сохраняем пользователя
-        users.set(socket.id, { username, socketId: socket.id });
+        const userData = { username, socketId: socket.id };
+        if (avatar) userData.avatar = avatar;
+        users.set(socket.id, userData);
         socket.username = username;
 
-        // Отправляем текущему пользователю список всех пользователей
-        const userList = Array.from(users.values()).map(u => ({ username: u.username, socketId: u.socketId }));
+        if (avatar) userAvatars.set(username, avatar);
+        else if (!userAvatars.has(username)) {
+            // Аватар по умолчанию – null, клиент сам покажет инициалы
+            userAvatars.set(username, null);
+        }
+
+        const userList = Array.from(users.values()).map(u => ({
+            username: u.username,
+            avatar: userAvatars.get(u.username) || null
+        }));
         socket.emit('user list', userList);
+        socket.broadcast.emit('user joined', {
+            username,
+            avatar: userAvatars.get(username)
+        });
 
-        // Оповещаем всех о новом пользователе
-        socket.broadcast.emit('user joined', { username, socketId: socket.id });
-
-        callback({ success: true, username });
+        callback({ success: true, username, avatar: userAvatars.get(username) });
     });
 
-    // Получение списка пользователей (для тех, кто уже зарегистрирован)
     socket.on('get users', () => {
-        const userList = Array.from(users.values()).map(u => ({ username: u.username, socketId: u.socketId }));
+        const userList = Array.from(users.values()).map(u => ({
+            username: u.username,
+            avatar: userAvatars.get(u.username) || null
+        }));
         socket.emit('user list', userList);
     });
 
-    // Запрос истории сообщений с конкретным пользователем
     socket.on('get history', (targetUsername) => {
-        const currentUsername = socket.username;
-        if (!currentUsername) return;
-        const key = getMessagesKey(currentUsername, targetUsername);
+        const current = socket.username;
+        if (!current) return;
+        const key = getDialogKey(current, targetUsername);
         const history = messages.get(key) || [];
         socket.emit('chat history', { target: targetUsername, messages: history });
     });
 
-    // Отправка личного сообщения
-    socket.on('private message', ({ to, text }) => {
+    socket.on('private message', ({ to, type, content }) => {
         const from = socket.username;
-        if (!from || !to || !text) return;
+        if (!from || !to) return;
 
         const message = {
+            id: Date.now() + Math.random(),
             from,
             to,
-            text,
+            type,        // 'text', 'image', 'voice'
+            content,     // текст или base64
             time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             timestamp: Date.now()
         };
 
-        // Сохраняем в историю
-        const key = getMessagesKey(from, to);
+        const key = getDialogKey(from, to);
         if (!messages.has(key)) messages.set(key, []);
-        messages.get(key).push(message);
-        // Ограничим историю 100 сообщениями на диалог
-        if (messages.get(key).length > 100) messages.get(key).shift();
+        const dialog = messages.get(key);
+        dialog.push(message);
+        if (dialog.length > 200) dialog.shift();
 
-        // Отправляем отправителю подтверждение (чтобы он увидел сообщение у себя)
+        // Отправить отправителю и получателю
         socket.emit('private message', message);
-
-        // Отправляем получателю, если он онлайн
-        let recipientSocketId = null;
-        for (let [id, user] of users.entries()) {
-            if (user.username === to) {
-                recipientSocketId = id;
+        let recipientId = null;
+        for (let [id, u] of users.entries()) {
+            if (u.username === to) {
+                recipientId = id;
                 break;
             }
         }
-        if (recipientSocketId) {
-            io.to(recipientSocketId).emit('private message', message);
+        if (recipientId) {
+            io.to(recipientId).emit('private message', message);
         }
     });
 
-    // Отключение пользователя
+    socket.on('update avatar', (avatarBase64) => {
+        const username = socket.username;
+        if (username && avatarBase64) {
+            userAvatars.set(username, avatarBase64);
+            const user = users.get(socket.id);
+            if (user) user.avatar = avatarBase64;
+            io.emit('avatar updated', { username, avatar: avatarBase64 });
+        }
+    });
+
     socket.on('disconnect', () => {
         const user = users.get(socket.id);
         if (user) {
@@ -110,13 +133,5 @@ io.on('connection', (socket) => {
     });
 });
 
-function getMessagesKey(user1, user2) {
-    // Сортируем имена для единого ключа диалога
-    const [a, b] = [user1, user2].sort();
-    return `${a}:${b}`;
-}
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
