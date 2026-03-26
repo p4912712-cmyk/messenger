@@ -8,11 +8,6 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
-
 app.use(express.static('public'));
 
 // Хранилище активных пользователей: socketId -> username
@@ -105,9 +100,7 @@ io.on('connection', (socket) => {
         if (!messages.has(key)) messages.set(key, []);
         const dialog = messages.get(key);
         dialog.push(message);
-        // Ограничим историю 200 сообщениями на диалог
         if (dialog.length > 200) dialog.shift();
-        // Сохраняем изменения в файл
         saveHistory();
 
         // Отправить отправителю
@@ -137,6 +130,7 @@ io.on('connection', (socket) => {
     });
 });
 
+// ЕДИНСТВЕННОЕ объявление PORT
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
