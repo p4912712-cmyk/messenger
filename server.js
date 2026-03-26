@@ -14,29 +14,36 @@ app.get('/ping', (req, res) => {
 
 app.use(express.static('public'));
 
-// Файл для хранения сообщений
+// Хранилища
+const users = new Map();          // socketId -> username
+const messages = new Map();       // key = "user1:user2" -> array
 const MESSAGES_FILE = path.join(__dirname, 'messages.json');
 
-// Загружаем сохранённые сообщения при старте
-let messages = new Map(); // ключ "user1:user2" -> массив сообщений
-if (fs.existsSync(MESSAGES_FILE)) {
+// Загружаем сообщения из файла
+function loadMessages() {
     try {
-        const data = fs.readFileSync(MESSAGES_FILE, 'utf8');
-        const parsed = JSON.parse(data);
-        messages = new Map(Object.entries(parsed));
+        if (fs.existsSync(MESSAGES_FILE)) {
+            const data = fs.readFileSync(MESSAGES_FILE, 'utf8');
+            const loaded = JSON.parse(data);
+            for (const [key, value] of Object.entries(loaded)) {
+                messages.set(key, value);
+            }
+            console.log('Messages loaded from file');
+        }
     } catch (err) {
-        console.error('Ошибка загрузки сообщений:', err);
+        console.error('Error loading messages:', err);
     }
 }
 
-// Функция сохранения сообщений в файл
+// Сохраняем сообщения в файл
 function saveMessages() {
     const obj = Object.fromEntries(messages);
-    fs.writeFileSync(MESSAGES_FILE, JSON.stringify(obj, null, 2));
+    fs.writeFile(MESSAGES_FILE, JSON.stringify(obj, null, 2), err => {
+        if (err) console.error('Error saving messages:', err);
+    });
 }
 
-// Хранилище пользователей онлайн
-const users = new Map(); // socketId -> { username }
+loadMessages();
 
 function getDialogKey(u1, u2) {
     const [a, b] = [u1, u2].sort();
@@ -46,12 +53,11 @@ function getDialogKey(u1, u2) {
 io.on('connection', (socket) => {
     console.log(`New connection: ${socket.id}`);
 
-    // Регистрация
     socket.on('register', ({ username }, callback) => {
-        // Проверка уникальности имени среди онлайн
+        // Проверка уникальности имени среди активных
         let isUnique = true;
         for (let [id, u] of users.entries()) {
-            if (u.username === username && id !== socket.id) {
+            if (u === username && id !== socket.id) {
                 isUnique = false;
                 break;
             }
@@ -61,31 +67,24 @@ io.on('connection', (socket) => {
             return;
         }
 
-        const userData = { username };
-        users.set(socket.id, userData);
+        users.set(socket.id, username);
         socket.username = username;
 
-        // Отправляем новому пользователю список онлайн-пользователей (всех, кроме него)
-        const userList = Array.from(users.values())
-            .filter(u => u.username !== username)
-            .map(u => ({ username: u.username }));
+        // Отправляем текущему пользователю список онлайн-пользователей
+        const userList = Array.from(users.values()).map(u => ({ username: u }));
         socket.emit('user list', userList);
 
-        // Оповещаем всех остальных о новом пользователе
+        // Оповещаем всех о новом пользователе
         socket.broadcast.emit('user joined', { username });
 
         callback({ success: true, username });
     });
 
-    // Получение списка онлайн-пользователей (для тех, кто уже зарегистрирован)
     socket.on('get users', () => {
-        const userList = Array.from(users.values())
-            .filter(u => u.username !== socket.username)
-            .map(u => ({ username: u.username }));
+        const userList = Array.from(users.values()).map(u => ({ username: u }));
         socket.emit('user list', userList);
     });
 
-    // Запрос истории сообщений с конкретным пользователем
     socket.on('get history', (targetUsername) => {
         const current = socket.username;
         if (!current) return;
@@ -94,17 +93,15 @@ io.on('connection', (socket) => {
         socket.emit('chat history', { target: targetUsername, messages: history });
     });
 
-    // Отправка личного сообщения
-    socket.on('private message', ({ to, type, content }) => {
+    socket.on('private message', ({ to, text }) => {
         const from = socket.username;
-        if (!from || !to) return;
+        if (!from || !to || !text) return;
 
         const message = {
             id: Date.now() + Math.random(),
             from,
             to,
-            type,        // 'text', 'image', 'voice'
-            content,     // текст или base64
+            text,
             time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             timestamp: Date.now()
         };
@@ -113,14 +110,18 @@ io.on('connection', (socket) => {
         if (!messages.has(key)) messages.set(key, []);
         const dialog = messages.get(key);
         dialog.push(message);
-        if (dialog.length > 200) dialog.shift(); // ограничим историю
-        saveMessages(); // сохраняем после каждого изменения
+        if (dialog.length > 200) dialog.shift();
 
-        // Отправить отправителю и получателю
+        // Сохраняем в файл
+        saveMessages();
+
+        // Отправляем отправителю
         socket.emit('private message', message);
+
+        // Отправляем получателю, если онлайн
         let recipientId = null;
         for (let [id, u] of users.entries()) {
-            if (u.username === to) {
+            if (u === to) {
                 recipientId = id;
                 break;
             }
@@ -130,18 +131,15 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Отключение пользователя
     socket.on('disconnect', () => {
-        const user = users.get(socket.id);
-        if (user) {
+        const username = users.get(socket.id);
+        if (username) {
             users.delete(socket.id);
-            socket.broadcast.emit('user left', user.username);
-            console.log(`User ${user.username} disconnected`);
+            io.emit('user left', username);
+            console.log(`User ${username} disconnected`);
         }
     });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));

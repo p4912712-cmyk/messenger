@@ -90,6 +90,7 @@
             font-size: 20px;
             color: white;
             margin-right: 12px;
+            object-fit: cover;
         }
         .chat-info { flex: 1; }
         .chat-name { font-weight: 600; margin-bottom: 4px; }
@@ -123,27 +124,8 @@
             justify-content: center;
         }
         .back-button:hover { background: #0b6e62; }
-        .chat-header-avatar {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            background: #25d366;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            color: white;
-        }
         .chat-header-info { flex: 1; }
         .chat-header-name { font-weight: bold; }
-        .call-button {
-            background: none;
-            border: none;
-            color: white;
-            font-size: 24px;
-            cursor: pointer;
-            padding: 8px;
-        }
         .messages-area {
             flex: 1;
             overflow-y: auto;
@@ -171,12 +153,6 @@
             align-self: flex-start;
             border-bottom-left-radius: 4px;
         }
-        .message-image {
-            max-width: 200px;
-            border-radius: 12px;
-            cursor: pointer;
-        }
-        .message-audio audio { max-width: 200px; height: 36px; }
         .message-time { font-size: 10px; color: #999; text-align: right; margin-top: 4px; }
         .input-area {
             background: #f0f0f0;
@@ -208,8 +184,6 @@
             justify-content: center;
         }
         .icon-button:hover { background: #e0e0e0; }
-        .record-btn.recording { background: #ff4444; color: white; animation: pulse 1s infinite; }
-        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
         @media (max-width: 768px) {
             .chat-header { padding: 8px 12px; }
             .back-button { width: 32px; height: 32px; font-size: 20px; }
@@ -243,20 +217,15 @@
         <div id="chatView" class="screen hidden">
             <div class="chat-header">
                 <button id="backBtn" class="back-button">←</button>
-                <div class="chat-header-avatar" id="chatAvatarPlaceholder"></div>
                 <div class="chat-header-info">
                     <div id="chatUserName" class="chat-header-name"></div>
                 </div>
-                <button id="callBtn" class="call-button">📞</button>
             </div>
             <div id="chatMessages" class="messages-area"></div>
             <div class="input-area">
-                <button id="attachImageBtn" class="icon-button">📷</button>
                 <input type="text" id="messageInput" placeholder="Сообщение">
                 <button id="sendTextBtn" class="icon-button">➤</button>
-                <button id="recordVoiceBtn" class="icon-button">🎤</button>
             </div>
-            <input type="file" id="imageFileInput" accept="image/*" style="display: none;">
         </div>
     </div>
 </div>
@@ -267,13 +236,9 @@
     let socket;
     let currentUser = null;
     let currentChatWith = null;
-    let onlineUsers = [];               // список имён онлайн-пользователей
-    let chats = new Map();              // username -> { lastMessage }
-    let messagesCache = new Map();      // username -> массив сообщений
-    let mediaRecorder;
-    let recordedChunks = [];
-    let isRecording = false;
-    let notificationPermission = false;
+    let allUsers = [];               // список онлайн-пользователей (имена)
+    let chats = new Map();           // username -> { lastMessage }
+    let messagesCache = new Map();   // username -> массив сообщений
 
     // DOM элементы
     const loginScreen = document.getElementById('loginScreen');
@@ -286,30 +251,132 @@
     const logoutBtn = document.getElementById('logoutBtn');
     const chatsListDiv = document.getElementById('chatsList');
     const backBtn = document.getElementById('backBtn');
-    const chatAvatarPlaceholder = document.getElementById('chatAvatarPlaceholder');
     const chatUserName = document.getElementById('chatUserName');
-    const callBtn = document.getElementById('callBtn');
     const chatMessagesDiv = document.getElementById('chatMessages');
     const messageInput = document.getElementById('messageInput');
     const sendTextBtn = document.getElementById('sendTextBtn');
-    const attachImageBtn = document.getElementById('attachImageBtn');
-    const imageFileInput = document.getElementById('imageFileInput');
-    const recordVoiceBtn = document.getElementById('recordVoiceBtn');
 
-    // ------------------- Вспомогательные функции -------------------
-    function getInitials(name) {
-        return name.charAt(0).toUpperCase();
+    // Запоминание устройства: проверяем localStorage при загрузке
+    const savedUsername = localStorage.getItem('messenger_username');
+    if (savedUsername) {
+        // Автоматически пытаемся войти
+        usernameInput.value = savedUsername;
+        // Можно вызвать вход автоматически, но для надёжности лучше дать кнопку.
+        // Однако сделаем автоматический вход после загрузки страницы.
+        window.addEventListener('load', () => {
+            if (savedUsername && !currentUser) {
+                login();
+            }
+        });
+    }
+
+    function login() {
+        const username = usernameInput.value.trim();
+        if (!username) {
+            loginError.textContent = 'Введите имя';
+            return;
+        }
+        socket = io();
+        socket.emit('register', { username }, (response) => {
+            if (response.success) {
+                currentUser = username;
+                localStorage.setItem('messenger_username', username);
+                loginScreen.classList.add('hidden');
+                mainApp.classList.remove('hidden');
+                chatsView.classList.remove('hidden');
+                chatView.classList.add('hidden');
+                setupSocketEvents();
+                socket.emit('get users');
+            } else {
+                loginError.textContent = response.error;
+                localStorage.removeItem('messenger_username');
+            }
+        });
+    }
+
+    loginBtn.onclick = login;
+
+    function setupSocketEvents() {
+        socket.on('user list', (users) => {
+            // Обновляем список онлайн
+            allUsers = users.map(u => u.username).filter(u => u !== currentUser);
+            // Перестраиваем chats только из онлайн-пользователей
+            const newChats = new Map();
+            for (let username of allUsers) {
+                const existing = chats.get(username);
+                newChats.set(username, {
+                    username: username,
+                    lastMessage: existing ? existing.lastMessage : null
+                });
+            }
+            chats = newChats;
+            updateChatsList();
+        });
+
+        socket.on('user joined', (user) => {
+            if (user.username !== currentUser && !allUsers.includes(user.username)) {
+                allUsers.push(user.username);
+                chats.set(user.username, { username: user.username, lastMessage: null });
+                updateChatsList();
+            }
+        });
+
+        socket.on('user left', (username) => {
+            if (username !== currentUser) {
+                allUsers = allUsers.filter(u => u !== username);
+                chats.delete(username);
+                updateChatsList();
+                // Если текущий чат с этим пользователем, закрываем
+                if (currentChatWith === username) {
+                    backBtn.click();
+                }
+            }
+        });
+
+        socket.on('private message', (msg) => {
+            const fromMe = msg.from === currentUser;
+            const other = fromMe ? msg.to : msg.from;
+            // Обновляем lastMessage для чата
+            if (chats.has(other)) {
+                chats.get(other).lastMessage = msg;
+                updateChatsList();
+            } else {
+                // Если пользователь онлайн, но почему-то нет в chats (должен быть), добавим
+                if (allUsers.includes(other)) {
+                    chats.set(other, { username: other, lastMessage: msg });
+                    updateChatsList();
+                }
+            }
+            // Если чат открыт, добавляем сообщение
+            if (currentChatWith === other) {
+                addMessageToChatUI(msg, fromMe);
+            } else {
+                // Уведомление (если нужно)
+                showNotification(msg.from, msg.text);
+            }
+            // Сохраняем в кэш
+            if (!messagesCache.has(other)) messagesCache.set(other, []);
+            messagesCache.get(other).push(msg);
+        });
+
+        socket.on('chat history', ({ target, messages }) => {
+            if (currentChatWith === target) {
+                chatMessagesDiv.innerHTML = '';
+                messages.forEach(m => {
+                    addMessageToChatUI(m, m.from === currentUser);
+                });
+                messagesCache.set(target, messages);
+            }
+        });
     }
 
     function updateChatsList() {
-        // Сортируем чаты по времени последнего сообщения
         const chatArray = Array.from(chats.values()).sort((a,b) => (b.lastMessage?.timestamp||0) - (a.lastMessage?.timestamp||0));
         chatsListDiv.innerHTML = chatArray.map(chat => `
             <div class="chat-item" data-username="${chat.username}">
-                <div class="chat-avatar">${getInitials(chat.username)}</div>
                 <div class="chat-info">
                     <div class="chat-name">${escapeHtml(chat.username)}</div>
-                    <div class="chat-last-msg">${chat.lastMessage ? (chat.lastMessage.type==='text'?escapeHtml(chat.lastMessage.content):(chat.lastMessage.type==='image'?'📷 Фото':'🎤 Голосовое')) : ''}</div>
+                    <div class="chat-last-msg">${chat.lastMessage ? escapeHtml(chat.lastMessage.text) : ''}</div>
                 </div>
             </div>
         `).join('');
@@ -321,30 +388,7 @@
     function addMessageToChatUI(msg, isOwn) {
         const div = document.createElement('div');
         div.className = `message ${isOwn ? 'sent' : 'received'}`;
-        if (msg.type === 'text') {
-            div.innerHTML = `<div>${escapeHtml(msg.content)}</div><div class="message-time">${msg.time}</div>`;
-        } else if (msg.type === 'image') {
-            const img = document.createElement('img');
-            img.src = msg.content;
-            img.className = 'message-image';
-            img.style.maxWidth = '200px';
-            img.style.borderRadius = '12px';
-            div.appendChild(img);
-            const timeSpan = document.createElement('div');
-            timeSpan.className = 'message-time';
-            timeSpan.textContent = msg.time;
-            div.appendChild(timeSpan);
-        } else if (msg.type === 'voice') {
-            const audio = document.createElement('audio');
-            audio.controls = true;
-            audio.src = msg.content;
-            audio.style.maxWidth = '200px';
-            div.appendChild(audio);
-            const timeSpan = document.createElement('div');
-            timeSpan.className = 'message-time';
-            timeSpan.textContent = msg.time;
-            div.appendChild(timeSpan);
-        }
+        div.innerHTML = `<div>${escapeHtml(msg.text)}</div><div class="message-time">${msg.time}</div>`;
         chatMessagesDiv.appendChild(div);
         chatMessagesDiv.scrollTop = chatMessagesDiv.scrollHeight;
     }
@@ -353,12 +397,23 @@
         socket.emit('get history', username);
     }
 
-    function sendMessage(type, content) {
-        if (!currentChatWith) return;
-        socket.emit('private message', { to: currentChatWith, type, content });
+    function sendMessage(text) {
+        if (!currentChatWith || !text) return;
+        socket.emit('private message', { to: currentChatWith, text });
+    }
+
+    function openChat(username) {
+        currentChatWith = username;
+        chatUserName.textContent = username;
+        chatsView.classList.add('hidden');
+        chatView.classList.remove('hidden');
+        chatMessagesDiv.innerHTML = '';
+        loadChatHistory(username);
+        messageInput.focus();
     }
 
     // Уведомления
+    let notificationPermission = false;
     function requestNotificationPermission() {
         if ('Notification' in window) {
             Notification.requestPermission().then(perm => {
@@ -385,155 +440,6 @@
         }
     }
 
-    // ------------------- Сокет события -------------------
-    function setupSocketEvents() {
-        socket.on('user list', (users) => {
-            onlineUsers = users.map(u => u.username);
-            // Обновляем чаты: оставляем только тех, кто онлайн
-            for (let [username, chat] of chats.entries()) {
-                if (!onlineUsers.includes(username)) {
-                    chats.delete(username);
-                }
-            }
-            // Добавляем новых онлайн-пользователей, которых ещё нет в чатах
-            for (let username of onlineUsers) {
-                if (!chats.has(username)) {
-                    chats.set(username, { username, lastMessage: null });
-                }
-            }
-            updateChatsList();
-        });
-
-        socket.on('user joined', (user) => {
-            if (user.username !== currentUser && !chats.has(user.username)) {
-                chats.set(user.username, { username: user.username, lastMessage: null });
-                updateChatsList();
-            }
-        });
-
-        socket.on('user left', (username) => {
-            if (chats.has(username)) {
-                chats.delete(username);
-                updateChatsList();
-                // Если текущий чат с ушедшим пользователем, закрываем его
-                if (currentChatWith === username) {
-                    backBtn.click();
-                }
-            }
-        });
-
-        socket.on('private message', (msg) => {
-            const fromMe = msg.from === currentUser;
-            const other = fromMe ? msg.to : msg.from;
-            // Обновляем последнее сообщение в чате
-            if (chats.has(other)) {
-                chats.get(other).lastMessage = msg;
-                updateChatsList();
-            }
-            if (currentChatWith === other) {
-                addMessageToChatUI(msg, fromMe);
-            } else {
-                showNotification(msg.from, msg.type === 'text' ? msg.content : (msg.type === 'image' ? '📷 Изображение' : '🎤 Голосовое'));
-            }
-            if (!messagesCache.has(other)) messagesCache.set(other, []);
-            messagesCache.get(other).push(msg);
-        });
-
-        socket.on('chat history', ({ target, messages }) => {
-            if (currentChatWith === target) {
-                chatMessagesDiv.innerHTML = '';
-                messages.forEach(m => {
-                    addMessageToChatUI(m, m.from === currentUser);
-                });
-                messagesCache.set(target, messages);
-            }
-        });
-    }
-
-    // ------------------- Открытие чата -------------------
-    function openChat(username) {
-        currentChatWith = username;
-        // Устанавливаем заголовок чата
-        chatUserName.textContent = username;
-        chatAvatarPlaceholder.textContent = getInitials(username);
-        chatsView.classList.add('hidden');
-        chatView.classList.remove('hidden');
-        chatMessagesDiv.innerHTML = '';
-        loadChatHistory(username);
-        messageInput.focus();
-    }
-
-    // ------------------- Запись голоса -------------------
-    async function startRecording() {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
-        recordedChunks = [];
-        mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
-        mediaRecorder.onstop = () => {
-            const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                sendMessage('voice', reader.result);
-            };
-            reader.readAsDataURL(blob);
-            stream.getTracks().forEach(track => track.stop());
-        };
-        mediaRecorder.start();
-        isRecording = true;
-        recordVoiceBtn.classList.add('recording');
-    }
-    function stopRecording() {
-        if (mediaRecorder && isRecording) {
-            mediaRecorder.stop();
-            isRecording = false;
-            recordVoiceBtn.classList.remove('recording');
-        }
-    }
-
-    // ------------------- Авторизация и запоминание устройства -------------------
-    function attemptAutoLogin() {
-        const savedUsername = localStorage.getItem('messenger_username');
-        if (savedUsername) {
-            usernameInput.value = savedUsername;
-            login();
-        }
-    }
-
-    function login() {
-        const username = usernameInput.value.trim();
-        if (!username) {
-            loginError.textContent = 'Введите имя';
-            return;
-        }
-        socket = io();
-        socket.emit('register', { username }, (response) => {
-            if (response.success) {
-                currentUser = username;
-                // Сохраняем имя в localStorage
-                localStorage.setItem('messenger_username', username);
-                loginScreen.classList.add('hidden');
-                mainApp.classList.remove('hidden');
-                chatsView.classList.remove('hidden');
-                chatView.classList.add('hidden');
-                setupSocketEvents();
-                requestNotificationPermission();
-                socket.emit('get users');
-            } else {
-                loginError.textContent = response.error;
-            }
-        });
-    }
-
-    loginBtn.onclick = login;
-    usernameInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') login();
-    });
-
-    logoutBtn.onclick = () => {
-        localStorage.removeItem('messenger_username');
-        location.reload();
-    };
-
     backBtn.onclick = () => {
         currentChatWith = null;
         chatView.classList.add('hidden');
@@ -541,12 +447,10 @@
         updateChatsList();
     };
 
-    callBtn.onclick = () => alert('Функция звонка в разработке');
-
     sendTextBtn.onclick = () => {
         const text = messageInput.value.trim();
         if (text && currentChatWith) {
-            sendMessage('text', text);
+            sendMessage(text);
             messageInput.value = '';
         }
     };
@@ -554,23 +458,10 @@
         if (e.key === 'Enter') sendTextBtn.click();
     });
 
-    attachImageBtn.onclick = () => imageFileInput.click();
-    imageFileInput.onchange = (e) => {
-        const file = e.target.files[0];
-        if (file && currentChatWith) {
-            const reader = new FileReader();
-            reader.onload = (ev) => {
-                sendMessage('image', ev.target.result);
-            };
-            reader.readAsDataURL(file);
-        }
-        imageFileInput.value = '';
+    logoutBtn.onclick = () => {
+        localStorage.removeItem('messenger_username');
+        location.reload();
     };
-
-    recordVoiceBtn.onmousedown = startRecording;
-    recordVoiceBtn.onmouseup = stopRecording;
-    recordVoiceBtn.ontouchstart = startRecording;
-    recordVoiceBtn.ontouchend = stopRecording;
 
     function escapeHtml(str) {
         return str.replace(/[&<>]/g, function(m) {
@@ -581,8 +472,8 @@
         });
     }
 
-    // Попытка автоматического входа
-    attemptAutoLogin();
+    // Запрашиваем разрешение на уведомления при загрузке
+    requestNotificationPermission();
 </script>
 </body>
 </html>
